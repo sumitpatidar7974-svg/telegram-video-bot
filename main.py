@@ -2438,42 +2438,121 @@ def handle_callback(call):
                              parse_mode='MarkdownV2')
 
 
+def start_bot_services():
+    """Start all bot services (Flask, scheduler, ping)"""
+    global bot_info_cache
+    
+    print("🤖 Enhanced Video Bot starting...")
+    print(f"👑 Owner User ID: {OWNER}")
+    print(f"👮 Admins: {ADMINS}")
+    print(f"📢 Channels: {CHANNEL_1}, {CHANNEL_2}")
+    
+    # Test bot connection and cache info
+    bot_info = bot.get_me()
+    bot_info_cache = {'username': bot_info.username}
+    print(f"✅ Bot connected successfully: @{bot_info.username}")
+
+    # Start scheduled broadcast processor in background
+    scheduler_thread = threading.Thread(
+        target=process_scheduled_broadcasts, daemon=True)
+    scheduler_thread.start()
+    print("⏰ Scheduled broadcast processor started")
+
+    # Start keep-alive ping for Render free tier (only if URL is set)
+    render_url = os.getenv('RENDER_EXTERNAL_URL')
+    if render_url:
+        ping_thread = threading.Thread(target=keep_alive_ping, daemon=True)
+        ping_thread.start()
+        print("🔄 Keep-alive ping started")
+    else:
+        print("⚠️ RENDER_EXTERNAL_URL not set - keep-alive ping disabled")
+
+    # Start Flask web server in background (for health checks)
+    port = int(os.getenv('PORT', 5000))  # Render will override with PORT env var
+    def run_flask():
+        app.run(host='0.0.0.0', port=port, debug=False)
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print(f"🌐 Web server started on port {port}")
+
+
+def start_bot_with_retry():
+    """Start bot with automatic restart on API timeout errors"""
+    max_retries = 5
+    retry_count = 0
+    
+    while True:
+        try:
+            print(f"🔄 Starting bot polling (attempt {retry_count + 1})")
+            bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
+        except ApiTelegramException as e:
+            error_msg = str(e).lower()
+            print(f"❌ Telegram API Error: {e}")
+            
+            # Handle specific timeout errors that should trigger restart
+            if any(phrase in error_msg for phrase in [
+                "query is too old", 
+                "response timeout expired", 
+                "query id is invalid",
+                "conflict: terminated by other getupdates request",
+                "network error",
+                "connection error"
+            ]):
+                retry_count += 1
+                if retry_count <= max_retries:
+                    wait_time = min(30 * retry_count, 300)  # Progressive backoff, max 5 minutes
+                    print(f"🔄 Retrying in {wait_time} seconds (attempt {retry_count}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"❌ Max retries ({max_retries}) exceeded. Restarting with fresh connection...")
+                    retry_count = 0  # Reset counter for fresh start
+                    time.sleep(60)  # Wait 1 minute before fresh restart
+                    continue
+            else:
+                # For other API errors, wait and retry
+                print(f"⚠️ Unhandled API error, waiting 30 seconds before retry...")
+                time.sleep(30)
+                continue
+                
+        except requests.exceptions.RequestException as e:
+            print(f"🌐 Network/Request Error: {e}")
+            retry_count += 1
+            if retry_count <= max_retries:
+                wait_time = min(15 * retry_count, 180)  # Progressive backoff, max 3 minutes  
+                print(f"🔄 Network retry in {wait_time} seconds (attempt {retry_count}/{max_retries})")
+                time.sleep(wait_time)
+                continue
+            else:
+                print(f"❌ Max network retries exceeded. Restarting...")
+                retry_count = 0
+                time.sleep(30)
+                continue
+                
+        except Exception as e:
+            print(f"💥 Unexpected Error: {e}")
+            print(f"🔄 Restarting in 10 seconds...")
+            time.sleep(10)
+            retry_count = 0  # Reset for unexpected errors
+            continue
+            
+        # If we get here, polling stopped normally (should not happen with none_stop=True)
+        print("⚠️ Polling stopped unexpectedly, restarting...")
+        time.sleep(5)
+
+
 if __name__ == "__main__":
     try:
-        print("🤖 Enhanced Video Bot starting...")
-        print(f"👑 Owner User ID: {OWNER}")
-        print(f"👮 Admins: {ADMINS}")
-        print(f"📢 Channels: {CHANNEL_1}, {CHANNEL_2}")
-        bot_info = bot.get_me()
-        bot_info_cache = {'username': bot_info.username}  # Cache for health checks
-        print(f"✅ Bot connected successfully: @{bot_info.username}")
-
-        # Start scheduled broadcast processor in background
-        scheduler_thread = threading.Thread(
-            target=process_scheduled_broadcasts, daemon=True)
-        scheduler_thread.start()
-        print("⏰ Scheduled broadcast processor started")
-
-        # Start keep-alive ping for Render free tier (only if URL is set)
-        render_url = os.getenv('RENDER_EXTERNAL_URL')
-        if render_url:
-            ping_thread = threading.Thread(target=keep_alive_ping, daemon=True)
-            ping_thread.start()
-            print("🔄 Keep-alive ping started")
-        else:
-            print("⚠️ RENDER_EXTERNAL_URL not set - keep-alive ping disabled")
-
-        # Start Flask web server in background (for health checks)
-        port = int(os.getenv('PORT', 5000))  # Use 5000 for Replit, Render will override with PORT env var
-        def run_flask():
-            app.run(host='0.0.0.0', port=port, debug=False)
+        # Initialize services once
+        start_bot_services()
         
-        flask_thread = threading.Thread(target=run_flask, daemon=True)
-        flask_thread.start()
-        print(f"🌐 Web server started on port {port}")
-
-        # Start bot polling
-        bot.polling(none_stop=True)
+        # Start bot with automatic retry/restart logic
+        start_bot_with_retry()
+        
+    except KeyboardInterrupt:
+        print("\n👋 Bot shutdown requested by user")
     except Exception as e:
-        print(f"Bot crashed: {e}")
-        time.sleep(10)
+        print(f"💥 Fatal error in main: {e}")
+        print("🔄 Attempting restart in 30 seconds...")
+        time.sleep(30)
